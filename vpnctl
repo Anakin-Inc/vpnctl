@@ -15,6 +15,8 @@
 #   vpnctl uninstall <name>
 #   vpnctl update                          pull latest vpnctl from the repo
 #   vpnctl autoupdate on|off|status        auto-pull latest daily + at boot
+#   vpnctl watch <name> [off|status|secs]  re-assert tunnel routes if another VPN
+#                                          (e.g. Cloudflare WARP) steals them
 set -euo pipefail
 
 SELF_RAW="${VPNCTL_RAW:-https://raw.githubusercontent.com/Anakin-Inc/vpnctl/main}/vpnctl"
@@ -28,6 +30,9 @@ plist_of(){ echo "$LD_DIR/com.vpn.$1.plist"; }
 label_of(){ echo "com.vpn.$1"; }
 conf_of(){  echo "$CONF_DIR/$1.ovpn"; }
 log_of(){   echo "/var/log/vpn-$1.log"; }
+watch_plist(){ echo "$LD_DIR/com.vpn.watch.$1.plist"; }
+watch_label(){ echo "com.vpn.watch.$1"; }
+watch_log(){   echo "/var/log/vpn-watch-$1.log"; }
 
 die(){ echo "vpnctl: $*" >&2; exit 1; }
 
@@ -225,9 +230,60 @@ cmd_logs(){    local n="${1:?usage: vpnctl logs <name>}";  assert_installed "$n"
 
 cmd_uninstall(){
   local n="${1:?usage: vpnctl uninstall <name>}"; assert_installed "$n"
+  launchctl bootout system "$(watch_plist "$n")" 2>/dev/null || true   # tear down watchdog too
+  rm -f "$(watch_plist "$n")" "$(watch_log "$n")"
   launchctl bootout system "$(plist_of "$n")" 2>/dev/null || true
   rm -f "$(plist_of "$n")" "$(conf_of "$n")" "$(log_of "$n")"
-  echo "uninstalled $n (daemon, config, log removed)"
+  echo "uninstalled $n (daemon, config, log, watchdog removed)"
+}
+
+# internal: check the profile's pushed routes are still on the tunnel; if another
+# VPN (e.g. WARP) stole them, restart the tunnel so OpenVPN re-asserts its routes.
+cmd_watchcheck(){
+  local n="${1:?}"; [ -e "$(plist_of "$n")" ] || return 0
+  local log; log="$(log_of "$n")"
+  # networks the server pushed, from the most recent PUSH_REPLY
+  local nets; nets="$(grep 'PUSH_REPLY' "$log" 2>/dev/null | tail -1 | grep -oE 'route [0-9.]+' | awk '{print $2}')"
+  [ -n "$nets" ] || return 0
+  local broken="" net iface
+  for net in $nets; do
+    iface="$(route -n get "$net" 2>/dev/null | awk '/interface:/{print $2}')"
+    case "$iface" in utun*) ;; *) broken="$broken $net→${iface:-none}" ;; esac
+  done
+  if [ -n "$broken" ]; then
+    echo "$(date '+%F %T') routes off-tunnel:$broken — restarting $n" >> "$(watch_log "$n")"
+    launchctl kickstart -k "system/$(label_of "$n")"
+  fi
+}
+
+cmd_watch(){
+  local n="${1:?usage: vpnctl watch <name> [off|status|secs]}"; assert_installed "$n"
+  local arg="${2:-on}"; local self; self="$(command -v vpnctl 2>/dev/null || echo /usr/local/bin/vpnctl)"
+  case "$arg" in
+    off)    launchctl bootout system "$(watch_plist "$n")" 2>/dev/null || true; rm -f "$(watch_plist "$n")"; echo "watch OFF for $n" ;;
+    status) if [ -e "$(watch_plist "$n")" ]; then echo "✅ watch ON for $n"; [ -f "$(watch_log "$n")" ] && { echo "  recent re-asserts:"; tail -3 "$(watch_log "$n")" | sed 's/^/    /'; }
+            else echo "⛔ watch OFF for $n  (enable: vpnctl watch $n)"; fi ;;
+    *)      local secs=30; case "$arg" in ''|*[!0-9]*) secs=30 ;; *) secs="$arg" ;; esac
+            cat > "$(watch_plist "$n")" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(watch_label "$n")</string>
+  <key>ProgramArguments</key>
+  <array><string>$self</string><string>_watchcheck</string><string>$n</string></array>
+  <key>StartInterval</key><integer>$secs</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$(watch_log "$n")</string>
+  <key>StandardErrorPath</key><string>$(watch_log "$n")</string>
+</dict>
+</plist>
+EOF
+            chown root:wheel "$(watch_plist "$n")"; chmod 644 "$(watch_plist "$n")"
+            launchctl bootout system "$(watch_plist "$n")" 2>/dev/null || true
+            launchctl bootstrap system "$(watch_plist "$n")"
+            echo "✅ watch ON for $n — re-asserts routes every ${secs}s (log: $(watch_log "$n"))" ;;
+  esac
 }
 
 cmd_update(){ # pull latest vpnctl over this file (cache-busted so it's truly latest)
@@ -291,10 +347,12 @@ main(){
     start|stop|restart|uninstall) need_root "$cmd" "$@"; "cmd_$cmd" "$@" ;;
     update)             need_root update "$@"; cmd_update "$@" ;;
     autoupdate)         case "${1:-status}" in status) cmd_autoupdate "$@" ;; *) need_root autoupdate "$@"; cmd_autoupdate "$@" ;; esac ;;
+    watch)              if [ "${2:-}" = status ]; then cmd_watch "$@"; else need_root watch "$@"; cmd_watch "$@"; fi ;;
+    _watchcheck)        need_root _watchcheck "$@"; cmd_watchcheck "$@" ;;
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }

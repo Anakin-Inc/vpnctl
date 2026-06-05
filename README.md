@@ -67,6 +67,26 @@ installer does the same thing.
 The config is your profile plus always-on hardening: `persist-tun`, `persist-key`,
 faster `ping-restart`, `resolv-retry infinite`, `connect-retry`.
 
+## Coexisting with another VPN (e.g. Cloudflare WARP)
+
+If you run a full-tunnel VPN like **Cloudflare WARP** alongside vpnctl, it can take over
+routing and **steal vpnctl's internal routes** when it reconnects (WARP excludes private
+`10/8`/`172.16/12`/`192.168/16` ranges, dumping them back to your local interface). Symptom:
+the tunnel shows `running` but internal hosts time out.
+
+Turn on the **route-watchdog** for that profile — it checks every 30s that the pushed
+routes are still on the tunnel and re-asserts them if something stole them:
+
+```sh
+vpnctl watch work            # enable (default every 30s)
+vpnctl watch work 60         # custom interval (seconds)
+vpnctl watch work status     # is it on? recent re-asserts
+vpnctl watch work off        # disable
+```
+
+A one-off `vpnctl restart <name>` also fixes a stolen route immediately; the watchdog
+just makes it self-healing.
+
 ## Pritunl
 
 Already have the Pritunl client installed with your profile? **You don't need a URL or
