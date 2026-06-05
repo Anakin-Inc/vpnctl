@@ -3,7 +3,8 @@
 # Portable: copy this single file to any Mac. Auto-detects Homebrew openvpn
 # (Apple Silicon /opt/homebrew or Intel /usr/local). No machine-specific paths.
 #
-#   vpnctl install <source> [name] [--stop-pritunl <id>]   .ovpn path | .zip path | https zip url
+#   vpnctl install <source> [name]         .ovpn path | .zip path | https zip url
+#                                          (auto-stops a Pritunl conn to the same server)
 #   vpnctl list
 #   vpnctl status  <name>
 #   vpnctl start   <name>
@@ -16,6 +17,7 @@
 set -euo pipefail
 
 SELF_RAW="${VPNCTL_RAW:-https://raw.githubusercontent.com/Anakin-Inc/vpnctl/main}/vpnctl"
+SELF_API="${VPNCTL_API:-https://api.github.com/repos/Anakin-Inc/vpnctl/contents/vpnctl}"  # bypasses raw CDN cache
 AU_LABEL=com.vpn.autoupdate
 AU_PLIST="/Library/LaunchDaemons/$AU_LABEL.plist"
 AU_LOG=/var/log/vpn-autoupdate.log
@@ -52,6 +54,26 @@ list_names(){ # all installed profile names
 
 assert_installed(){ [ -e "$(plist_of "$1")" ] || die "no such profile '$1' (try: vpnctl list)"; }
 
+PRITUNL_CLI="/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+
+pritunl_stop(){ # stop+disable a Pritunl profile id (so it can't reconnect/autostart)
+  [ -x "$PRITUNL_CLI" ] || return 0
+  echo "==> stopping Pritunl profile $1 (frees the tunnel)"
+  "$PRITUNL_CLI" stop "$1" 2>/dev/null || true
+  "$PRITUNL_CLI" disable "$1" 2>/dev/null || true
+}
+
+# auto-detect a running Pritunl connection to the SAME server as $1 (remote host)
+# and stop it — so you don't have to pass --stop-pritunl. Echoes ids it stopped.
+pritunl_autostop(){
+  local host="$1"; [ -x "$PRITUNL_CLI" ] && [ -n "$host" ] || return 0
+  # `pritunl-client list` prints a pipe table; col2=ID, col7=SERVER ADDRESS.
+  local ids; ids="$("$PRITUNL_CLI" list 2>/dev/null \
+    | awk -F'|' -v ip="$host" 'NR>3 && $7 ~ ip {gsub(/ /,"",$2); if ($2!="") print $2}')"
+  [ -n "$ids" ] && echo "==> Pritunl auto-detect: found connection(s) to $host"
+  local id; for id in $ids; do pritunl_stop "$id"; done
+}
+
 cmd_install(){
   local SRC="" NAME="" PRITUNL_ID=""
   while [ $# -gt 0 ]; do
@@ -84,10 +106,11 @@ cmd_install(){
   local CONF PLIST LABEL LOG
   CONF="$(conf_of "$NAME")"; PLIST="$(plist_of "$NAME")"; LABEL="$(label_of "$NAME")"; LOG="$(log_of "$NAME")"
 
-  if [ -n "$PRITUNL_ID" ]; then
-    local CLI="/Applications/Pritunl.app/Contents/Resources/pritunl-client"
-    [ -x "$CLI" ] && { echo "==> stopping Pritunl profile $PRITUNL_ID"; "$CLI" stop "$PRITUNL_ID" 2>/dev/null || true; "$CLI" disable "$PRITUNL_ID" 2>/dev/null || true; }
-  fi
+  # free the tunnel if Pritunl is holding it: auto-detect by matching server,
+  # plus honor an explicit --stop-pritunl <id> if given.
+  local REMOTE_HOST; REMOTE_HOST="$(awk '/^remote /{print $2; exit}' "$RAW")"
+  pritunl_autostop "$REMOTE_HOST"
+  [ -n "$PRITUNL_ID" ] && pritunl_stop "$PRITUNL_ID"
 
   echo "==> writing hardened config -> $CONF"
   mkdir -p "$CONF_DIR"
@@ -173,8 +196,12 @@ cmd_update(){ # pull latest vpnctl over this file (cache-busted so it's truly la
   local self tmp before after
   self="$(command -v vpnctl 2>/dev/null || echo /usr/local/bin/vpnctl)"
   tmp="$(mktemp)"
-  echo "==> fetching latest from $SELF_RAW"
-  curl -fsSL "$SELF_RAW?t=$(date +%s)" -o "$tmp" || die "download failed"
+  echo "==> fetching latest (GitHub API, uncached)"
+  # API contents endpoint serves the true latest (not behind the 5-min raw CDN);
+  # fall back to the raw URL if the API is unreachable/rate-limited.
+  curl -fsSL -H "Accept: application/vnd.github.raw" "$SELF_API" -o "$tmp" \
+    || curl -fsSL "$SELF_RAW?t=$(date +%s)" -o "$tmp" \
+    || die "download failed"
   head -1 "$tmp" | grep -q '^#!/bin/bash' || die "downloaded file doesn't look like vpnctl"
   before="$(shasum "$self" 2>/dev/null | awk '{print $1}')"
   after="$(shasum "$tmp"  | awk '{print $1}')"
@@ -229,7 +256,7 @@ main(){
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }

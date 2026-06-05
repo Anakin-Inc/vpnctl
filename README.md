@@ -69,9 +69,10 @@ faster `ping-restart`, `resolv-retry infinite`, `connect-retry`.
 
 ## Pritunl
 
-Migrating off the Pritunl client? Pass `--stop-pritunl <profile-id>` to `vpnctl install`
-to stop and disable the competing Pritunl connection (find the id with
-`/Applications/Pritunl.app/Contents/Resources/pritunl-client list`).
+Migrating off the Pritunl client? `vpnctl install` **auto-detects** a running Pritunl
+connection to the same server (matched by remote address) and stops + disables it, so
+the two don't fight over the tunnel — no flags needed. To force-stop a specific profile
+regardless, pass `--stop-pritunl <profile-id>` (ids: `pritunl-client list`).
 
 ## Notes
 
