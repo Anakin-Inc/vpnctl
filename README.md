@@ -26,9 +26,16 @@ vpnctl logs     work        # live tail
 vpnctl stop     work
 vpnctl start    work
 vpnctl uninstall work       # remove daemon + config + log
+vpnctl update               # upgrade vpnctl itself to the latest from this repo
 ```
 
 The profile name is auto-derived from the file if you omit it.
+
+## Updating
+
+`vpnctl update` pulls the latest `vpnctl` from this repo over your installed copy
+(cache-busted, so it gets the true latest even right after a push) and shows the
+before/after checksum. Re-running the `curl … | bash` installer does the same thing.
 
 ## How it stays on
 

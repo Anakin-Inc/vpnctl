@@ -11,8 +11,10 @@
 #   vpnctl restart <name>
 #   vpnctl logs    <name>
 #   vpnctl uninstall <name>
+#   vpnctl update                          pull latest vpnctl from the repo
 set -euo pipefail
 
+SELF_RAW="${VPNCTL_RAW:-https://raw.githubusercontent.com/Anakin-Inc/vpnctl/main}/vpnctl"
 CONF_DIR=/etc/vpnctl
 LD_DIR=/Library/LaunchDaemons
 plist_of(){ echo "$LD_DIR/com.vpn.$1.plist"; }
@@ -163,15 +165,30 @@ cmd_uninstall(){
   echo "uninstalled $n (daemon, config, log removed)"
 }
 
+cmd_update(){ # pull latest vpnctl over this file (cache-busted so it's truly latest)
+  local self tmp before after
+  self="$(command -v vpnctl 2>/dev/null || echo /usr/local/bin/vpnctl)"
+  tmp="$(mktemp)"
+  echo "==> fetching latest from $SELF_RAW"
+  curl -fsSL "$SELF_RAW?t=$(date +%s)" -o "$tmp" || die "download failed"
+  head -1 "$tmp" | grep -q '^#!/bin/bash' || die "downloaded file doesn't look like vpnctl"
+  before="$(shasum "$self" 2>/dev/null | awk '{print $1}')"
+  after="$(shasum "$tmp"  | awk '{print $1}')"
+  if [ "$before" = "$after" ]; then echo "already up to date ($self)"; rm -f "$tmp"; return; fi
+  install -m 755 "$tmp" "$self"; rm -f "$tmp"
+  echo "✅ updated $self"; echo "   was: ${before:-none}"; echo "   now: $after"
+}
+
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     install)            need_root install "$@";   cmd_install "$@" ;;
     start|stop|restart|uninstall) need_root "$cmd" "$@"; "cmd_$cmd" "$@" ;;
+    update)             need_root update "$@"; cmd_update "$@" ;;
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }
