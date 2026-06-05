@@ -40,12 +40,32 @@ need_root(){ # re-exec under sudo for mutating commands
   if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
 }
 
-find_openvpn(){
+find_openvpn(){  # echo path + return 0, or return 1 (NEVER die — used in $())
+  local p
   for p in /opt/homebrew/sbin/openvpn /usr/local/sbin/openvpn /opt/homebrew/bin/openvpn /usr/local/bin/openvpn; do
-    [ -x "$p" ] && { echo "$p"; return; }
+    [ -x "$p" ] && { echo "$p"; return 0; }
   done
-  command -v openvpn 2>/dev/null && return
-  die "openvpn not found — install it:  brew install openvpn"
+  command -v openvpn 2>/dev/null && return 0
+  return 1
+}
+
+find_brew(){
+  local p; for p in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$p" ] && { echo "$p"; return 0; }; done
+  command -v brew 2>/dev/null && return 0
+  return 1
+}
+
+# called in the MAIN shell (so die works): auto-install OpenVPN via the user's brew
+ensure_openvpn(){
+  find_openvpn >/dev/null && return 0
+  local brew user; brew="$(find_brew || true)"; user="${SUDO_USER:-$(id -un)}"
+  [ -n "$brew" ] || die "OpenVPN and Homebrew are both missing on this machine.
+  Run the bootstrap (installs Homebrew + OpenVPN as your user, then vpnctl):
+    curl -fsSL ${SELF_RAW%/vpnctl}/install.sh | bash"
+  [ "$user" = root ] && die "OpenVPN missing and can't install brew packages as root — run: sudo -u <you> $brew install openvpn"
+  echo "==> OpenVPN not found — installing via Homebrew (as $user)…"
+  sudo -u "$user" -H "$brew" install openvpn || die "brew install openvpn failed"
+  find_openvpn >/dev/null || die "OpenVPN still not found after install"
 }
 
 # pid of a running profile (matches its config path); empty if down
@@ -104,6 +124,7 @@ cmd_install(){
     esac
   done
 
+  ensure_openvpn                      # auto-installs OpenVPN if missing (dies clearly if it can't)
   local OPENVPN; OPENVPN="$(find_openvpn)"
   local WORK; WORK="$(mktemp -d)"; trap 'rm -rf "${WORK:-}"' RETURN  # guard: trap leaks to main's RETURN where WORK is unset
 

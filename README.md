@@ -10,8 +10,10 @@ Always-on OpenVPN for macOS. Each VPN profile runs as its own `launchd` daemon, 
 curl -fsSL https://raw.githubusercontent.com/Anakin-Inc/vpnctl/main/install.sh | bash
 ```
 
-Installs the `vpnctl` command (and OpenVPN via Homebrew if missing). `sudo` prompts on
-your terminal. The only prerequisite is [Homebrew](https://brew.sh).
+Installs the `vpnctl` command and its dependencies — **auto-installs Homebrew and OpenVPN
+if they're missing**. `sudo` prompts on your terminal. No prerequisites. (`vpnctl install`
+also self-installs OpenVPN if it's somehow absent, so it works no matter how `vpnctl` got
+onto the machine.)
 
 ## Use
 
