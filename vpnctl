@@ -1,0 +1,178 @@
+#!/bin/bash
+# vpnctl — always-on OpenVPN manager for macOS (one launchd daemon per profile).
+# Portable: copy this single file to any Mac. Auto-detects Homebrew openvpn
+# (Apple Silicon /opt/homebrew or Intel /usr/local). No machine-specific paths.
+#
+#   vpnctl install <source> [name] [--stop-pritunl <id>]   .ovpn path | .zip path | https zip url
+#   vpnctl list
+#   vpnctl status  <name>
+#   vpnctl start   <name>
+#   vpnctl stop    <name>
+#   vpnctl restart <name>
+#   vpnctl logs    <name>
+#   vpnctl uninstall <name>
+set -euo pipefail
+
+CONF_DIR=/etc/vpnctl
+LD_DIR=/Library/LaunchDaemons
+plist_of(){ echo "$LD_DIR/com.vpn.$1.plist"; }
+label_of(){ echo "com.vpn.$1"; }
+conf_of(){  echo "$CONF_DIR/$1.ovpn"; }
+log_of(){   echo "/var/log/vpn-$1.log"; }
+
+die(){ echo "vpnctl: $*" >&2; exit 1; }
+
+need_root(){ # re-exec under sudo for mutating commands
+  if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
+}
+
+find_openvpn(){
+  for p in /opt/homebrew/sbin/openvpn /usr/local/sbin/openvpn /opt/homebrew/bin/openvpn /usr/local/bin/openvpn; do
+    [ -x "$p" ] && { echo "$p"; return; }
+  done
+  command -v openvpn 2>/dev/null && return
+  die "openvpn not found — install it:  brew install openvpn"
+}
+
+# pid of a running profile (matches its config path); empty if down
+pid_of(){ pgrep -f "$(conf_of "$1")" 2>/dev/null | head -1; }
+
+list_names(){ # all installed profile names
+  for f in "$LD_DIR"/com.vpn.*.plist; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f")"; b="${b#com.vpn.}"; echo "${b%.plist}"
+  done
+}
+
+assert_installed(){ [ -e "$(plist_of "$1")" ] || die "no such profile '$1' (try: vpnctl list)"; }
+
+cmd_install(){
+  local SRC="" NAME="" PRITUNL_ID=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stop-pritunl) PRITUNL_ID="${2:-}"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *) if [ -z "$SRC" ]; then SRC="$1"; elif [ -z "$NAME" ]; then NAME="$1"; fi; shift ;;
+    esac
+  done
+  [ -z "$SRC" ] && die "usage: vpnctl install <source.ovpn|.zip|https-url> [name] [--stop-pritunl <id>]"
+
+  local OPENVPN; OPENVPN="$(find_openvpn)"
+  local WORK; WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' RETURN
+
+  echo "==> resolving source: $SRC"
+  local RAW=""
+  case "$SRC" in
+    https://*|http://*) curl -fsSk -o "$WORK/p.zip" "$SRC"; ( cd "$WORK" && unzip -oq p.zip ); RAW="$(find "$WORK" -name '*.ovpn' | head -1)" ;;
+    *.zip)              ( cd "$WORK" && unzip -oq "$SRC" );                                   RAW="$(find "$WORK" -name '*.ovpn' | head -1)" ;;
+    *.ovpn)             RAW="$SRC" ;;
+    *) die "unknown source type (need .ovpn, .zip, or http/https url)" ;;
+  esac
+  [ -n "$RAW" ] && [ -f "$RAW" ] || die "no .ovpn found in source"
+
+  [ -z "$NAME" ] && NAME="$(basename "$RAW" .ovpn)"
+  NAME="$(printf '%s' "$NAME" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/^-*//;s/-*$//')"
+  [ -n "$NAME" ] || die "could not derive a valid name; pass one explicitly"
+  echo "    name: $NAME   (from $(basename "$RAW"))"
+
+  local CONF PLIST LABEL LOG
+  CONF="$(conf_of "$NAME")"; PLIST="$(plist_of "$NAME")"; LABEL="$(label_of "$NAME")"; LOG="$(log_of "$NAME")"
+
+  if [ -n "$PRITUNL_ID" ]; then
+    local CLI="/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+    [ -x "$CLI" ] && { echo "==> stopping Pritunl profile $PRITUNL_ID"; "$CLI" stop "$PRITUNL_ID" 2>/dev/null || true; "$CLI" disable "$PRITUNL_ID" 2>/dev/null || true; }
+  fi
+
+  echo "==> writing hardened config -> $CONF"
+  mkdir -p "$CONF_DIR"
+  sed -e 's/^ping 10$/ping 5/' -e 's/^ping-restart 60$/ping-restart 20/' -e 's/^verb 2$/verb 3/' "$RAW" > "$CONF"
+  cat >> "$CONF" <<'EOF'
+
+# --- always-on hardening (vpnctl) ---
+persist-key
+persist-tun
+nobind
+resolv-retry infinite
+connect-retry 2
+mute-replay-warnings
+pull-filter ignore "ping"
+EOF
+  chmod 600 "$CONF"
+
+  echo "==> writing daemon -> $PLIST"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$OPENVPN</string><string>--config</string><string>$CONF</string></array>
+  <key>WorkingDirectory</key><string>$CONF_DIR</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+EOF
+  chown root:wheel "$PLIST"; chmod 644 "$PLIST"
+
+  echo "==> loading"
+  launchctl bootout system "$PLIST" 2>/dev/null || true
+  launchctl bootstrap system "$PLIST"
+  launchctl enable "system/$LABEL"
+  sleep 6
+  cmd_status "$NAME"
+}
+
+cmd_list(){
+  printf "%-28s %-9s %-8s %s\n" NAME STATE PID UPTIME
+  local any=0
+  for n in $(list_names); do
+    any=1; local p; p="$(pid_of "$n")"
+    if [ -n "$p" ]; then printf "%-28s %-9s %-8s %s\n" "$n" running "$p" "$(ps -o etime= -p "$p" 2>/dev/null | tr -d ' ')"
+    else printf "%-28s %-9s %-8s %s\n" "$n" stopped - -; fi
+  done
+  [ "$any" = 0 ] && echo "(no profiles installed — vpnctl install <source>)"
+}
+
+cmd_status(){
+  local n="${1:-}"; [ -n "$n" ] || die "usage: vpnctl status <name>"; assert_installed "$n"
+  local p log gw; p="$(pid_of "$n")"; log="$(log_of "$n")"
+  if [ -n "$p" ]; then echo "✅ $n  running (pid $p, up $(ps -o etime= -p "$p" 2>/dev/null | tr -d ' '))"
+  else echo "⛔ $n  stopped"; fi
+  if [ -f "$log" ]; then
+    grep -q "Initialization Sequence Completed" "$log" 2>/dev/null && echo "   tunnel: initialized"
+    netstat -rn -f inet 2>/dev/null | awk '/utun/{print "   route:", $1, "->", $2}' | grep -E '10/|192\.168' | sort -u | head -6
+    gw="$(grep -oE 'route-gateway [0-9.]+' "$log" 2>/dev/null | tail -1 | awk '{print $2}')"
+    if [ -n "$gw" ]; then ping -c2 -t3 "$gw" >/dev/null 2>&1 && echo "   gateway $gw: OK" || echo "   gateway $gw: no reply"; fi
+  fi
+}
+
+cmd_start(){   local n="${1:?usage: vpnctl start <name>}"; assert_installed "$n"; launchctl bootstrap system "$(plist_of "$n")" 2>/dev/null || launchctl kickstart "system/$(label_of "$n")"; echo "started $n"; }
+cmd_stop(){    local n="${1:?usage: vpnctl stop <name>}";  assert_installed "$n"; launchctl bootout system "$(plist_of "$n")" 2>/dev/null || true; echo "stopped $n"; }
+cmd_restart(){ local n="${1:?usage: vpnctl restart <name>}"; assert_installed "$n"; launchctl kickstart -k "system/$(label_of "$n")"; echo "restarted $n"; }
+cmd_logs(){    local n="${1:?usage: vpnctl logs <name>}";  assert_installed "$n"; tail -f "$(log_of "$n")"; }
+
+cmd_uninstall(){
+  local n="${1:?usage: vpnctl uninstall <name>}"; assert_installed "$n"
+  launchctl bootout system "$(plist_of "$n")" 2>/dev/null || true
+  rm -f "$(plist_of "$n")" "$(conf_of "$n")" "$(log_of "$n")"
+  echo "uninstalled $n (daemon, config, log removed)"
+}
+
+main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    install)            need_root install "$@";   cmd_install "$@" ;;
+    start|stop|restart|uninstall) need_root "$cmd" "$@"; "cmd_$cmd" "$@" ;;
+    list)               cmd_list ;;
+    status)             cmd_status "$@" ;;
+    logs)               cmd_logs "$@" ;;
+    ""|-h|--help|help)  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$cmd' (try: vpnctl help)" ;;
+  esac
+}
+main "$@"
