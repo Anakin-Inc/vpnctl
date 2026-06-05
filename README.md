@@ -69,10 +69,18 @@ faster `ping-restart`, `resolv-retry infinite`, `connect-retry`.
 
 ## Pritunl
 
-Migrating off the Pritunl client? `vpnctl install` **auto-detects** a running Pritunl
-connection to the same server (matched by remote address) and stops + disables it, so
-the two don't fight over the tunnel — no flags needed. To force-stop a specific profile
-regardless, pass `--stop-pritunl <profile-id>` (ids: `pritunl-client list`).
+Already have the Pritunl client installed with your profile? **You don't need a URL or
+file at all** — `vpnctl install` with no arguments picks up Pritunl's already-downloaded
+profile automatically:
+
+```sh
+vpnctl install              # auto-pick the installed Pritunl profile
+vpnctl install anakin-vpn   # if you have several, pick one by name
+```
+
+It also **auto-detects and stops** the running Pritunl connection to the same server, so
+the two don't fight over the tunnel. To force-stop a specific profile, pass
+`--stop-pritunl <profile-id>` (ids: `pritunl-client list`).
 
 ## Notes
 

@@ -3,8 +3,9 @@
 # Portable: copy this single file to any Mac. Auto-detects Homebrew openvpn
 # (Apple Silicon /opt/homebrew or Intel /usr/local). No machine-specific paths.
 #
-#   vpnctl install <source> [name]         .ovpn path | .zip path | https zip url
-#                                          (auto-stops a Pritunl conn to the same server)
+#   vpnctl install [source] [name]         source = .ovpn | .zip | https zip url;
+#                                          omit it to auto-pick an installed Pritunl
+#                                          profile. Auto-stops the matching Pritunl conn.
 #   vpnctl list
 #   vpnctl status  <name>
 #   vpnctl start   <name>
@@ -74,31 +75,65 @@ pritunl_autostop(){
   local id; for id in $ids; do pritunl_stop "$id"; done
 }
 
+# the invoking user's home (we run as root via sudo, so $HOME would be root's)
+real_home(){ local u="${SUDO_USER:-$(id -un)}"; [ "$u" = root ] && echo "$HOME" || echo "/Users/$u"; }
+pritunl_dir(){ echo "$(real_home)/Library/Application Support/pritunl/profiles"; }
+pritunl_ovpns(){ ls "$(pritunl_dir)"/*.ovpn 2>/dev/null; }
+# is this arg an explicit source (vs a bare name)?
+looks_like_source(){ case "$1" in http://*|https://*|*.ovpn|*.zip) return 0;; *) [ -f "$1" ];; esac; }
+# friendly name for a Pritunl .ovpn: sibling .conf "server", else filename
+pritunl_name_of(){ local c="${1%.ovpn}.conf" n=""
+  [ -f "$c" ] && n="$(grep -o '"server":"[^"]*"' "$c" 2>/dev/null | head -1 | sed 's/.*:"//;s/"//')"
+  echo "${n:-$(basename "$1" .ovpn)}"; }
+
 cmd_install(){
   local SRC="" NAME="" PRITUNL_ID=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --stop-pritunl) PRITUNL_ID="${2:-}"; shift 2 ;;
       -*) die "unknown flag: $1" ;;
-      *) if [ -z "$SRC" ]; then SRC="$1"; elif [ -z "$NAME" ]; then NAME="$1"; fi; shift ;;
+      # an explicit source goes to SRC; a bare word is treated as the name
+      *) if [ -z "$SRC" ] && looks_like_source "$1"; then SRC="$1"
+         elif [ -z "$NAME" ]; then NAME="$1"
+         else die "unexpected argument: $1"; fi; shift ;;
     esac
   done
-  [ -z "$SRC" ] && die "usage: vpnctl install <source.ovpn|.zip|https-url> [name] [--stop-pritunl <id>]"
 
   local OPENVPN; OPENVPN="$(find_openvpn)"
   local WORK; WORK="$(mktemp -d)"; trap 'rm -rf "${WORK:-}"' RETURN  # guard: trap leaks to main's RETURN where WORK is unset
 
-  echo "==> resolving source: $SRC"
   local RAW=""
-  case "$SRC" in
-    https://*|http://*) curl -fsSk -o "$WORK/p.zip" "$SRC"; ( cd "$WORK" && unzip -oq p.zip ); RAW="$(find "$WORK" -name '*.ovpn' | head -1)" ;;
-    *.zip)              ( cd "$WORK" && unzip -oq "$SRC" );                                   RAW="$(find "$WORK" -name '*.ovpn' | head -1)" ;;
-    *.ovpn)             RAW="$SRC" ;;
-    *) die "unknown source type (need .ovpn, .zip, or http/https url)" ;;
-  esac
+  if [ -z "$SRC" ]; then
+    # no source given → auto-pick from an installed Pritunl client (no URL needed)
+    local profs cnt; profs="$(pritunl_ovpns)"; cnt="$(printf '%s' "$profs" | grep -c .)"
+    [ "$cnt" -ge 1 ] || die "no source given and no Pritunl profiles found in $(pritunl_dir)
+  give one: vpnctl install <profile.ovpn|.zip|https-url> [name]"
+    if [ -n "$NAME" ]; then                       # match the requested name
+      RAW="$(printf '%s\n' "$profs" | while read -r f; do [ "$(pritunl_name_of "$f")" = "$NAME" ] && { echo "$f"; break; }; done)"
+      [ -n "$RAW" ] || die "no Pritunl profile named '$NAME' (try: vpnctl install)"
+    elif [ "$cnt" -eq 1 ]; then                   # exactly one → use it
+      RAW="$profs"
+    else                                          # several → list and ask
+      echo "Multiple Pritunl profiles found — pick one by name:"
+      printf '%s\n' "$profs" | while read -r f; do echo "  $(pritunl_name_of "$f")"; done
+      die "re-run: vpnctl install <name>"
+    fi
+    echo "==> auto-picked Pritunl profile: $(basename "$RAW")"
+  else
+    echo "==> resolving source: $SRC"
+    case "$SRC" in
+      https://*|http://*) curl -fsSk -o "$WORK/p.zip" "$SRC"; ( cd "$WORK" && unzip -oq p.zip ); RAW="$(find "$WORK" -name '*.ovpn' | head -1)" ;;
+      *.zip)              ( cd "$WORK" && unzip -oq "$SRC" );                                   RAW="$(find "$WORK" -name '*.ovpn' | head -1)" ;;
+      *.ovpn)             RAW="$SRC" ;;
+      *) die "unknown source type (need .ovpn, .zip, or http/https url)" ;;
+    esac
+  fi
   [ -n "$RAW" ] && [ -f "$RAW" ] || die "no .ovpn found in source"
 
-  [ -z "$NAME" ] && NAME="$(basename "$RAW" .ovpn)"
+  # name: explicit > Pritunl server name (auto-pick) > profile filename
+  if [ -z "$NAME" ]; then
+    if [ -z "$SRC" ]; then NAME="$(pritunl_name_of "$RAW")"; else NAME="$(basename "$RAW" .ovpn)"; fi
+  fi
   NAME="$(printf '%s' "$NAME" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/^-*//;s/-*$//')"
   [ -n "$NAME" ] || die "could not derive a valid name; pass one explicitly"
   echo "    name: $NAME   (from $(basename "$RAW"))"
@@ -259,7 +294,7 @@ main(){
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }
