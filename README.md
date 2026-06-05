@@ -33,9 +33,20 @@ The profile name is auto-derived from the file if you omit it.
 
 ## Updating
 
-`vpnctl update` pulls the latest `vpnctl` from this repo over your installed copy
-(cache-busted, so it gets the true latest even right after a push) and shows the
-before/after checksum. Re-running the `curl … | bash` installer does the same thing.
+The installer turns on **auto-update by default** — a `launchd` timer runs
+`vpnctl update` daily and at every boot, so devices stay current with no action.
+This only swaps the `vpnctl` binary; it never disrupts running tunnels.
+
+```sh
+vpnctl autoupdate status        # is it on? when did it last run?
+vpnctl autoupdate on [hours]    # enable / change interval (default 24h)
+vpnctl autoupdate off           # disable
+vpnctl update                   # update now, manually (cache-busted, shows before/after)
+```
+
+`vpnctl update` pulls the latest from this repo over your installed copy (cache-busted,
+so it gets the true latest even right after a push). Re-running the `curl … | bash`
+installer does the same thing.
 
 ## How it stays on
 

@@ -20,6 +20,9 @@ sudo mkdir -p "$(dirname "$DEST")"
 curl -fsSL "$REPO_RAW/vpnctl" | sudo tee "$DEST" >/dev/null
 sudo chmod 755 "$DEST"
 
+# 3. keep it current automatically (daily + at boot)
+sudo "$DEST" autoupdate on >/dev/null && echo "==> autoupdate enabled (daily)"
+
 echo "✅ vpnctl installed. Next:"
 echo "   vpnctl install <profile.ovpn | profile.zip | https://host/key/XXXX.zip> [name]"
 echo "   vpnctl list"

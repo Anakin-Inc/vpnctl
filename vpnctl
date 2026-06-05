@@ -12,9 +12,13 @@
 #   vpnctl logs    <name>
 #   vpnctl uninstall <name>
 #   vpnctl update                          pull latest vpnctl from the repo
+#   vpnctl autoupdate on|off|status        auto-pull latest daily + at boot
 set -euo pipefail
 
 SELF_RAW="${VPNCTL_RAW:-https://raw.githubusercontent.com/Anakin-Inc/vpnctl/main}/vpnctl"
+AU_LABEL=com.vpn.autoupdate
+AU_PLIST="/Library/LaunchDaemons/$AU_LABEL.plist"
+AU_LOG=/var/log/vpn-autoupdate.log
 CONF_DIR=/etc/vpnctl
 LD_DIR=/Library/LaunchDaemons
 plist_of(){ echo "$LD_DIR/com.vpn.$1.plist"; }
@@ -179,16 +183,53 @@ cmd_update(){ # pull latest vpnctl over this file (cache-busted so it's truly la
   echo "✅ updated $self"; echo "   was: ${before:-none}"; echo "   now: $after"
 }
 
+cmd_autoupdate(){ # on [interval_hours] | off | status   (launchd timer running 'vpnctl update')
+  local sub="${1:-status}"; local self; self="$(command -v vpnctl 2>/dev/null || echo /usr/local/bin/vpnctl)"
+  case "$sub" in
+    on)
+      local hrs="${2:-24}"; local secs=$(( hrs * 3600 ))
+      cat > "$AU_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AU_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$self</string><string>update</string></array>
+  <key>StartInterval</key><integer>$secs</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$AU_LOG</string>
+  <key>StandardErrorPath</key><string>$AU_LOG</string>
+</dict>
+</plist>
+EOF
+      chown root:wheel "$AU_PLIST"; chmod 644 "$AU_PLIST"
+      launchctl bootout system "$AU_PLIST" 2>/dev/null || true
+      launchctl bootstrap system "$AU_PLIST"
+      echo "✅ autoupdate ON — checks every ${hrs}h and at boot (log: $AU_LOG)" ;;
+    off)
+      launchctl bootout system "$AU_PLIST" 2>/dev/null || true
+      rm -f "$AU_PLIST"; echo "autoupdate OFF" ;;
+    status)
+      if [ -e "$AU_PLIST" ]; then
+        echo "✅ autoupdate ON ($AU_PLIST)"
+        [ -f "$AU_LOG" ] && { echo "   last run:"; tail -3 "$AU_LOG" | sed 's/^/     /'; }
+      else echo "⛔ autoupdate OFF  (enable: vpnctl autoupdate on)"; fi ;;
+    *) die "usage: vpnctl autoupdate on [interval_hours] | off | status" ;;
+  esac
+}
+
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     install)            need_root install "$@";   cmd_install "$@" ;;
     start|stop|restart|uninstall) need_root "$cmd" "$@"; "cmd_$cmd" "$@" ;;
     update)             need_root update "$@"; cmd_update "$@" ;;
+    autoupdate)         case "${1:-status}" in status) cmd_autoupdate "$@" ;; *) need_root autoupdate "$@"; cmd_autoupdate "$@" ;; esac ;;
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }
