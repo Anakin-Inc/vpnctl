@@ -86,7 +86,7 @@ cmd_install(){
   [ -z "$SRC" ] && die "usage: vpnctl install <source.ovpn|.zip|https-url> [name] [--stop-pritunl <id>]"
 
   local OPENVPN; OPENVPN="$(find_openvpn)"
-  local WORK; WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' RETURN
+  local WORK; WORK="$(mktemp -d)"; trap 'rm -rf "${WORK:-}"' RETURN  # guard: trap leaks to main's RETURN where WORK is unset
 
   echo "==> resolving source: $SRC"
   local RAW=""
