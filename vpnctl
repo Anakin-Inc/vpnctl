@@ -5,10 +5,7 @@
 #
 #   vpnctl install [source] [name]         source = .ovpn | .zip | https zip url;
 #                                          omit it to auto-pick an installed Pritunl
-#                                          profile, or — for newer service-backed
-#                                          Pritunl clients with no .ovpn on disk —
-#                                          adopt the currently CONNECTED Pritunl
-#                                          tunnel. Auto-stops the matching Pritunl conn.
+#                                          profile. Auto-stops the matching Pritunl conn.
 #   vpnctl list
 #   vpnctl status  <name>
 #   vpnctl start   <name>
@@ -114,26 +111,6 @@ pritunl_name_of(){ local c="${1%.ovpn}.conf" n=""
   [ -f "$c" ] && n="$(grep -o '"server":"[^"]*"' "$c" 2>/dev/null | head -1 | sed 's/.*:"//;s/"//')"
   echo "${n:-$(basename "$1" .ovpn)}"; }
 
-# Newer service-backed Pritunl clients keep NO .ovpn on disk — they write a
-# transient config to /tmp/pritunl/<id> (root-only) and launch openvpn against
-# it, deleting it on disconnect. When the user has such a client AND a profile is
-# actively connected, we can still adopt it by reading the live process args.
-# echoes "<config-path>\t<auth-path>" of the connected tunnel (auth may be empty).
-pritunl_live_config(){
-  ps -Axww -o args= 2>/dev/null | awk '
-    /pritunl-openvpn/ && /--config/ {
-      cfg=""; auth=""
-      for (i=1;i<=NF;i++){ if($i=="--config")cfg=$(i+1); if($i=="--auth-user-pass")auth=$(i+1) }
-      if (cfg!=""){ print cfg "\t" auth; exit }
-    }'
-}
-# friendly name of the connected Pritunl profile (list col3=Name), else empty
-pritunl_live_name(){
-  [ -x "$PRITUNL_CLI" ] || return 0
-  "$PRITUNL_CLI" list 2>/dev/null \
-    | awk -F'|' 'NR>3 {gsub(/^[ \t]+|[ \t]+$/,"",$3); if($3!=""){print $3; exit}}'
-}
-
 cmd_install(){
   local SRC="" NAME="" PRITUNL_ID=""
   while [ $# -gt 0 ]; do
@@ -151,41 +128,23 @@ cmd_install(){
   local OPENVPN; OPENVPN="$(find_openvpn)"
   local WORK; WORK="$(mktemp -d)"; trap 'rm -rf "${WORK:-}"' RETURN  # guard: trap leaks to main's RETURN where WORK is unset
 
-  local RAW="" LIVE_AUTH=""
+  local RAW=""
   if [ -z "$SRC" ]; then
     # no source given → auto-pick from an installed Pritunl client (no URL needed)
     local profs cnt; profs="$(pritunl_ovpns)"; cnt="$(printf '%s' "$profs" | grep -c .)"
-    if [ "$cnt" -ge 1 ]; then
-      if [ -n "$NAME" ]; then                     # match the requested name
-        RAW="$(printf '%s\n' "$profs" | while read -r f; do [ "$(pritunl_name_of "$f")" = "$NAME" ] && { echo "$f"; break; }; done)"
-        [ -n "$RAW" ] || die "no Pritunl profile named '$NAME' (try: vpnctl install)"
-      elif [ "$cnt" -eq 1 ]; then                 # exactly one → use it
-        RAW="$profs"
-      else                                        # several → list and ask
-        echo "Multiple Pritunl profiles found — pick one by name:"
-        printf '%s\n' "$profs" | while read -r f; do echo "  $(pritunl_name_of "$f")"; done
-        die "re-run: vpnctl install <name>"
-      fi
-      echo "==> auto-picked Pritunl profile: $(basename "$RAW")"
-    else
-      # no .ovpn on disk → newer service-backed client: adopt the LIVE connection.
-      local live cfg auth; live="$(pritunl_live_config)"
-      [ -n "$live" ] || die "no source given, and no Pritunl profile to adopt.
-  - no .ovpn in $(pritunl_dir)
-  - no connected pritunl-openvpn process to copy a live config from
-  Connect the profile in the Pritunl app first, or give a source:
-    vpnctl install <profile.ovpn|.zip|https-url> [name]"
-      cfg="${live%%$'\t'*}"; auth="${live#*$'\t'}"; [ "$auth" = "$live" ] && auth=""
-      [ -f "$cfg" ] || die "Pritunl live config not readable: $cfg
-  (it's root-only — rerun as: sudo vpnctl install)"
-      # COPY now, before pritunl_autostop disconnects and /tmp/pritunl/<id> vanishes.
-      cp "$cfg" "$WORK/live.ovpn"; RAW="$WORK/live.ovpn"
-      if [ -n "$auth" ] && [ -f "$auth" ]; then cp "$auth" "$WORK/live.auth"; LIVE_AUTH="$WORK/live.auth"; fi
-      [ -n "$NAME" ] || NAME="$(pritunl_live_name)"
-      [ -n "$NAME" ] || NAME="$(awk '/^remote /{print $2; exit}' "$RAW")"
-      echo "==> adopted LIVE Pritunl connection: $(basename "$cfg")${LIVE_AUTH:+ (+ auth)}"
-      [ -n "$LIVE_AUTH" ] && echo "    note: Pritunl auth tokens can expire — if the tunnel later fails auth, re-run install while connected"
+    [ "$cnt" -ge 1 ] || die "no source given and no Pritunl profiles found in $(pritunl_dir)
+  give one: vpnctl install <profile.ovpn|.zip|https-url> [name]"
+    if [ -n "$NAME" ]; then                       # match the requested name
+      RAW="$(printf '%s\n' "$profs" | while read -r f; do [ "$(pritunl_name_of "$f")" = "$NAME" ] && { echo "$f"; break; }; done)"
+      [ -n "$RAW" ] || die "no Pritunl profile named '$NAME' (try: vpnctl install)"
+    elif [ "$cnt" -eq 1 ]; then                   # exactly one → use it
+      RAW="$profs"
+    else                                          # several → list and ask
+      echo "Multiple Pritunl profiles found — pick one by name:"
+      printf '%s\n' "$profs" | while read -r f; do echo "  $(pritunl_name_of "$f")"; done
+      die "re-run: vpnctl install <name>"
     fi
+    echo "==> auto-picked Pritunl profile: $(basename "$RAW")"
   else
     echo "==> resolving source: $SRC"
     case "$SRC" in
@@ -220,7 +179,7 @@ cmd_install(){
   # across reconnects and SKIP re-adding pushed routes (e.g. 10.0.0.0/16), leaving
   # the tunnel "up" but with no route to internal networks.
   sed -e 's/^ping 10$/ping 5/' -e 's/^ping-restart 60$/ping-restart 20/' \
-      -e 's/^verb 2$/verb 3/' -e '/^persist-tun$/d' -e '/^auth-user-pass/d' "$RAW" > "$CONF"
+      -e 's/^verb 2$/verb 3/' -e '/^persist-tun$/d' "$RAW" > "$CONF"
   cat >> "$CONF" <<'EOF'
 
 # --- always-on hardening (vpnctl) ---
@@ -231,13 +190,6 @@ connect-retry 2
 mute-replay-warnings
 pull-filter ignore "ping"
 EOF
-  # adopted from a live Pritunl process → persist its auth file alongside the config
-  if [ -n "$LIVE_AUTH" ]; then
-    local AUTHF="${CONF%.ovpn}.auth"
-    cp "$LIVE_AUTH" "$AUTHF"; chown root:wheel "$AUTHF"; chmod 600 "$AUTHF"
-    printf 'auth-user-pass %s\n' "$AUTHF" >> "$CONF"
-    echo "==> persisted Pritunl auth -> $AUTHF"
-  fi
   chmod 600 "$CONF"
 
   echo "==> writing daemon -> $PLIST"
@@ -302,8 +254,8 @@ cmd_uninstall(){
   launchctl bootout system "$(watch_plist "$n")" 2>/dev/null || true   # tear down watchdog too
   rm -f "$(watch_plist "$n")" "$(watch_log "$n")"
   launchctl bootout system "$(plist_of "$n")" 2>/dev/null || true
-  rm -f "$(plist_of "$n")" "$(conf_of "$n")" "$(log_of "$n")" "$(conf_of "$n" | sed 's/\.ovpn$/.auth/')"
-  echo "uninstalled $n (daemon, config, auth, log, watchdog removed)"
+  rm -f "$(plist_of "$n")" "$(conf_of "$n")" "$(log_of "$n")"
+  echo "uninstalled $n (daemon, config, log, watchdog removed)"
 }
 
 # internal: check the profile's pushed routes are still on the tunnel; if another
@@ -412,8 +364,7 @@ EOF
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    install)            case "${1:-}" in -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
-                        need_root install "$@";   cmd_install "$@" ;;
+    install)            need_root install "$@";   cmd_install "$@" ;;
     start|stop|restart|uninstall) need_root "$cmd" "$@"; "cmd_$cmd" "$@" ;;
     update)             need_root update "$@"; cmd_update "$@" ;;
     autoupdate)         case "${1:-status}" in status) cmd_autoupdate "$@" ;; *) need_root autoupdate "$@"; cmd_autoupdate "$@" ;; esac ;;
@@ -422,7 +373,7 @@ main(){
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }
