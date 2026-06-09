@@ -20,6 +20,10 @@
 #   vpnctl autoupdate on|off|status        auto-pull latest daily + at boot
 #   vpnctl watch <name> [off|status|secs]  re-assert tunnel routes if another VPN
 #                                          (e.g. Cloudflare WARP) steals them
+#   vpnctl pritunl <id|name> [off|status|secs]  keepalive for the NEW service-backed
+#                                          Pritunl client: re-dials via its CLI when
+#                                          the tunnel drops unattended (sleep/wake).
+#                                          id from `pritunl-client list`.
 set -euo pipefail
 
 SELF_RAW="${VPNCTL_RAW:-https://raw.githubusercontent.com/Anakin-Inc/vpnctl/main}/vpnctl"
@@ -36,6 +40,9 @@ log_of(){   echo "/var/log/vpn-$1.log"; }
 watch_plist(){ echo "$LD_DIR/com.vpn.watch.$1.plist"; }
 watch_label(){ echo "com.vpn.watch.$1"; }
 watch_log(){   echo "/var/log/vpn-watch-$1.log"; }
+pk_plist(){ echo "$LD_DIR/com.vpn.pritunl.$1.plist"; }   # pritunl keepalive daemon
+pk_label(){ echo "com.vpn.pritunl.$1"; }
+pk_log(){   echo "/var/log/vpn-pritunl-$1.log"; }
 
 die(){ echo "vpnctl: $*" >&2; exit 1; }
 
@@ -133,6 +140,37 @@ pritunl_live_name(){
   "$PRITUNL_CLI" list 2>/dev/null \
     | awk -F'|' 'NR>3 {gsub(/^[ \t]+|[ \t]+$/,"",$3); if($3!=""){print $3; exit}}'
 }
+
+# --- new service-backed pritunl-client (pritunl/pritunl-client) supervision ---
+# It mints single-use, timestamped auth per connect, so vpnctl can't run its
+# OpenVPN standalone. Instead we DRIVE its CLI: each `start` re-mints fresh auth
+# via the service. `enable` only auto-connects at boot — it does NOT re-dial on a
+# mid-session drop (sleep/wake, network flap), so we keepalive it ourselves.
+find_pritunl_cli(){  # echo path or return 1
+  local p
+  for p in "$PRITUNL_CLI" /usr/local/bin/pritunl-client /opt/homebrew/bin/pritunl-client; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  command -v pritunl-client 2>/dev/null && return 0
+  return 1
+}
+# `pritunl-client list --json` → array of {id,name,connected,...}. python3 picks
+# the row by id-or-name. helper used for both the connected check and id resolve.
+pritunl_json_pick(){ # $1=id-or-name  $2=field(connected|id)
+  local cli; cli="$(find_pritunl_cli)" || return 1
+  "$cli" list --json 2>/dev/null | python3 -c '
+import sys,json
+want,field=sys.argv[1],sys.argv[2]
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+for p in d:
+  if want in (p.get("id"),p.get("name")) or str(p.get("id","")).startswith(want):
+    print(1 if p.get("connected") else 0) if field=="connected" else print(p.get("id",""))
+    sys.exit(0)
+sys.exit(1)' "$1" "$2" 2>/dev/null
+}
+pritunl_resolve_id(){ pritunl_json_pick "$1" id 2>/dev/null || echo "$1"; }
+pritunl_is_connected(){ [ "$(pritunl_json_pick "$1" connected 2>/dev/null)" = 1 ]; }
 
 cmd_install(){
   local SRC="" NAME="" PRITUNL_ID=""
@@ -355,6 +393,49 @@ EOF
   esac
 }
 
+# internal: if the pritunl profile dropped, re-dial it through the CLI (fresh auth)
+cmd_pritunlcheck(){
+  local id="${1:?}" cli; cli="$(find_pritunl_cli)" || { echo "$(date '+%F %T') pritunl-client not found" >> "$(pk_log "$id")"; return 0; }
+  pritunl_is_connected "$id" && return 0
+  echo "$(date '+%F %T') $id not connected — re-dialing" >> "$(pk_log "$id")"
+  "$cli" enable "$id" >> "$(pk_log "$id")" 2>&1 || true   # ensure autostart survives reboot
+  "$cli" start  "$id" >> "$(pk_log "$id")" 2>&1 || true   # service re-mints fresh auth
+}
+
+# keepalive supervisor for a new service-backed Pritunl profile (id from `pritunl-client list`)
+cmd_pritunl(){
+  local raw="${1:?usage: vpnctl pritunl <profile-id|name> [off|status|secs]}"
+  local arg="${2:-on}"; local self; self="$(command -v vpnctl 2>/dev/null || echo /usr/local/bin/vpnctl)"
+  find_pritunl_cli >/dev/null || die "pritunl-client not found (install the Pritunl client first)"
+  local id; id="$(pritunl_resolve_id "$raw")"
+  case "$arg" in
+    off)    launchctl bootout system "$(pk_plist "$id")" 2>/dev/null || true; rm -f "$(pk_plist "$id")"; echo "pritunl keepalive OFF for $id" ;;
+    status) if [ -e "$(pk_plist "$id")" ]; then echo "✅ pritunl keepalive ON for $id"; pritunl_is_connected "$id" && echo "   currently: connected" || echo "   currently: DISCONNECTED"
+              [ -f "$(pk_log "$id")" ] && { echo "   recent re-dials:"; tail -3 "$(pk_log "$id")" | sed 's/^/     /'; }
+            else echo "⛔ pritunl keepalive OFF for $id  (enable: vpnctl pritunl $raw)"; fi ;;
+    *)      local secs=30; case "$arg" in ''|*[!0-9]*) secs=30 ;; *) secs="$arg" ;; esac
+            cat > "$(pk_plist "$id")" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(pk_label "$id")</string>
+  <key>ProgramArguments</key>
+  <array><string>$self</string><string>_pritunlcheck</string><string>$id</string></array>
+  <key>StartInterval</key><integer>$secs</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$(pk_log "$id")</string>
+  <key>StandardErrorPath</key><string>$(pk_log "$id")</string>
+</dict>
+</plist>
+EOF
+            chown root:wheel "$(pk_plist "$id")"; chmod 644 "$(pk_plist "$id")"
+            launchctl bootout system "$(pk_plist "$id")" 2>/dev/null || true
+            launchctl bootstrap system "$(pk_plist "$id")"
+            echo "✅ pritunl keepalive ON for $id — re-dials if dropped, every ${secs}s (log: $(pk_log "$id"))" ;;
+  esac
+}
+
 cmd_update(){ # pull latest vpnctl over this file (cache-busted so it's truly latest)
   local self tmp before after
   self="$(command -v vpnctl 2>/dev/null || echo /usr/local/bin/vpnctl)"
@@ -412,17 +493,19 @@ EOF
 main(){
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    install)            case "${1:-}" in -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+    install)            case "${1:-}" in -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
                         need_root install "$@";   cmd_install "$@" ;;
     start|stop|restart|uninstall) need_root "$cmd" "$@"; "cmd_$cmd" "$@" ;;
     update)             need_root update "$@"; cmd_update "$@" ;;
     autoupdate)         case "${1:-status}" in status) cmd_autoupdate "$@" ;; *) need_root autoupdate "$@"; cmd_autoupdate "$@" ;; esac ;;
     watch)              if [ "${2:-}" = status ]; then cmd_watch "$@"; else need_root watch "$@"; cmd_watch "$@"; fi ;;
     _watchcheck)        need_root _watchcheck "$@"; cmd_watchcheck "$@" ;;
+    pritunl)            if [ "${2:-}" = status ]; then cmd_pritunl "$@"; else need_root pritunl "$@"; cmd_pritunl "$@"; fi ;;
+    _pritunlcheck)      need_root _pritunlcheck "$@"; cmd_pritunlcheck "$@" ;;
     list)               cmd_list ;;
     status)             cmd_status "$@" ;;
     logs)               cmd_logs "$@" ;;
-    ""|-h|--help|help)  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+    ""|-h|--help|help)  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$cmd' (try: vpnctl help)" ;;
   esac
 }
